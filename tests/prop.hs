@@ -191,6 +191,13 @@ prop_asyncExceptionInterrupts ex drv before after = QC.ioProperty $ do
   r1 <- timeout 100000 $ atomically $ guard . not =<< readTVar inNontermV
   return $ (r, r1) == (Left ex, Just ())
 
+prop_length :: BuilderTree -> QC.Property
+prop_length tree = QC.ioProperty $ IO.withFile "/dev/null" IO.WriteMode $ \h -> do
+  let b = mkBuilder tree
+  let len = BS.length $ toStrictByteString b
+  len' <- hPutBuilder h b
+  return $ len QC.=== len'
+
 -- | Write/write optimization does not break semantics.
 prop_writeWrite :: Word8 -> Word8 -> Bool
 prop_writeWrite w0 w1

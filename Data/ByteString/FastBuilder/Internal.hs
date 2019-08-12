@@ -78,7 +78,7 @@ import Foreign.Ptr
 import qualified System.IO as IO
 import System.IO.Unsafe
 
-import GHC.Exts (Addr#, State#, RealWorld, Ptr(..), Int(..), Int#)
+import GHC.Exts (Addr#, State#, RealWorld, Ptr(..), Int(..), Int#, (+#), minusAddr#)
 import GHC.Magic (oneShot)
 import GHC.IO (IO(..), unIO)
 import GHC.CString (unpackCString#)
@@ -104,7 +104,7 @@ newtype Builder = Builder
 -- * The "cur" pointer
 -- * The "end" pointer
 -- * The state token
-type BuilderState = (# Addr#, Addr#, State# RealWorld #)
+type BuilderState = (# Addr#, Addr#, Int#, State# RealWorld #)
 
 instance Sem.Semigroup Builder where
   (<>) = appendBuilder
@@ -225,8 +225,12 @@ instance Monad BuildM where
 
 -- | Create a builder from a BuildM.
 mkBuilder :: BuildM () -> Builder
-mkBuilder (BuildM bb) = bb $ \_ -> mempty
+mkBuilder  (BuildM bb) = bb $ \_ -> mempty
 {-# INLINE mkBuilder #-}
+
+setLen :: Int -> BuildM ()
+setLen (I# len') = useBuilder
+  $ Builder (\_ (# cur, end, len, s #) -> (# cur, end, len +# len', s #))
 
 -- | Embed a builder in the BuildM context.
 useBuilder :: Builder -> BuildM ()
@@ -235,33 +239,33 @@ useBuilder b = BuildM $ \k -> b <> k ()
 
 -- | Get the 'DataSink'.
 getSink :: BuildM DataSink
-getSink = BuildM $ \k -> Builder $ \dex (# cur, end, s #) ->
-  unBuilder (k dex) dex (# cur, end, s #)
+getSink = BuildM $ \k -> Builder $ \dex (# cur, end, len, s #) ->
+  unBuilder (k dex) dex (# cur, end, len, s #)
 
 -- | Get the current pointer.
 getCur :: BuildM (Ptr Word8)
-getCur = BuildM $ \k -> Builder $ \dex (# cur, end, s #) ->
-  unBuilder (k (Ptr cur)) dex (# cur, end, s #)
+getCur = BuildM $ \k -> Builder $ \dex (# cur, end, len, s #) ->
+  unBuilder (k (Ptr cur)) dex (# cur, end, len, s #)
 
 -- | Get the end-of-buffer pointer.
 getEnd :: BuildM (Ptr Word8)
-getEnd = BuildM $ \k -> Builder $ \dex (# cur, end, s #) ->
-  unBuilder (k (Ptr end)) dex (# cur, end, s #)
+getEnd = BuildM $ \k -> Builder $ \dex (# cur, end, len, s #) ->
+  unBuilder (k (Ptr end)) dex (# cur, end, len, s #)
 
 -- | Set the current pointer.
 setCur :: Ptr Word8 -> BuildM ()
-setCur (Ptr p) = BuildM $ \k -> Builder $ \dex (# _, end, s #) ->
-  unBuilder (k ()) dex (# p, end, s #)
+setCur (Ptr p) = BuildM $ \k -> Builder $ \dex (# _, end, len, s #) ->
+  unBuilder (k ()) dex (# p, end, len, s #)
 
 -- | Set the end-of-buffer pointer.
 setEnd :: Ptr Word8 -> BuildM ()
-setEnd (Ptr p) = BuildM $ \k -> Builder $ \dex (# cur, _, s #) ->
-  unBuilder (k ()) dex (# cur, p, s #)
+setEnd (Ptr p) = BuildM $ \k -> Builder $ \dex (# cur, _, len, s #) ->
+  unBuilder (k ()) dex (# cur, p, len, s #)
 
 -- | Perform IO.
 io :: IO a -> BuildM a
-io (IO x) = BuildM $ \k -> Builder $ \dex (# cur, end, s #) -> case x s of
-  (# s', val #) -> unBuilder (k val) dex (# cur, end, s' #)
+io (IO x) = BuildM $ \k -> Builder $ \dex (# cur, end, len, s #) -> case x s of
+  (# s', val #) -> unBuilder (k val) dex (# cur, end, len, s' #)
 
 -- | Embed a 'BuilderState' transformer into `BuildM`.
 updateState :: (BuilderState -> BuilderState) -> BuildM ()
@@ -284,19 +288,19 @@ instance Monoid Write where
 -- | Turn a 'PI.BoundedPrim' into a 'Write'.
 writeBoundedPrim :: PI.BoundedPrim a -> a -> Write
 writeBoundedPrim prim x =
-  Write (PI.sizeBound prim) $ \(# cur, end, s #) ->
+  Write (PI.sizeBound prim) $ \(# cur, end, len, s #) ->
     case unIO (PI.runB prim x (Ptr cur)) s of
-      (# s', Ptr cur' #) -> (# cur', end, s' #)
+      (# s', Ptr cur' #) -> (# cur', end, len +# minusAddr# cur' cur, s' #)
 
 ----------------------------------------------------------------
 --
 -- Running builders.
 
 -- | Run a builder.
-runBuilder :: Builder -> DataSink -> Ptr Word8 -> Ptr Word8 -> IO (Ptr Word8)
+runBuilder :: Builder -> DataSink -> Ptr Word8 -> Ptr Word8 -> IO (Ptr Word8, Int)
 runBuilder (Builder f) sink (Ptr cur) (Ptr end) = IO $ \s ->
-  case f sink (# cur, end, s #) of
-    (# cur', _, s' #) -> (# s', Ptr cur' #)
+  case f sink (# cur, end, 0#, s #) of
+    (# cur', _, len, s' #) -> (# s', (Ptr cur', I# len) #)
 
 -- | Turn a 'Builder' into a lazy 'L.ByteString'.
 --
@@ -334,7 +338,7 @@ toLazyByteStringWith !initialSize !maxSize builder = unsafePerformIO $ do
   sink <- newIORef $ BoundedGrowingBuffer fptr maxSize
   let !base = unsafeForeignPtrToPtr fptr
   let
-    finalPtr = unsafeDupablePerformIO $
+    (finalPtr, _) = unsafeDupablePerformIO $
       -- The use of unsafeDupablePerformIO is safe here, because at any given
       -- time, at most one thread can be attempting to evaluate this finalPtr
       -- thunk.
@@ -455,26 +459,27 @@ toStrictByteString builder = unsafePerformIO $ do
   fptr <- mallocForeignPtrBytes cap
   bufferRef <- newIORef fptr
   let !base = unsafeForeignPtrToPtr fptr
-  cur <- runBuilder builder (GrowingBuffer bufferRef) base (base `plusPtr` cap)
+  (cur, _) <- runBuilder builder (GrowingBuffer bufferRef) base (base `plusPtr` cap)
   endFptr <- readIORef bufferRef
   let !written = cur `minusPtr` unsafeForeignPtrToPtr endFptr
   return $ S.fromForeignPtr endFptr 0 written
 
 -- | Output a 'Builder' to a 'IO.Handle'.
-hPutBuilder :: IO.Handle -> Builder -> IO ()
+hPutBuilder :: IO.Handle -> Builder -> IO Int
 hPutBuilder !h builder = hPutBuilderWith h 100 4096 builder
 
 -- | Like 'hPutBuffer', but allows the user to specify the initial
 -- and the subsequent desired buffer sizes. This function may be useful for
 -- setting large buffer when high throughput I/O is needed.
-hPutBuilderWith :: IO.Handle -> Int -> Int -> Builder -> IO ()
+hPutBuilderWith :: IO.Handle -> Int -> Int -> Builder -> IO Int
 hPutBuilderWith !h !initialCap !nextCap builder = do
   fptr <- mallocForeignPtrBytes initialCap
   qRef <- newIORef $ Queue fptr 0
   let !base = unsafeForeignPtrToPtr fptr
-  cur <- runBuilder builder (HandleSink h nextCap qRef)
+  (cur, len) <- runBuilder builder (HandleSink h nextCap qRef)
     base (base `plusPtr` initialCap)
   flushQueue h qRef cur
+  return len
 
 ----------------------------------------------------------------
 -- builders
@@ -556,6 +561,7 @@ byteStringCopy !bstr =
 -- | Like 'byteStringCopy', but assumes that the current buffer is large enough.
 byteStringCopyNoCheck :: S.ByteString -> Builder
 byteStringCopyNoCheck !bstr = mkBuilder $ do
+  setLen len
   cur <- getCur
   io $ S.unsafeUseAsCString bstr $ \ptr ->
     copyBytes cur (castPtr ptr) len
@@ -572,6 +578,7 @@ byteStringInsert !bstr = byteStringInsert_ bstr
 -- | The body of the 'byteStringInsert', worker-wrappered manually.
 byteStringInsert_ :: S.ByteString -> Builder
 byteStringInsert_ bstr = mkBuilder $ do
+  setLen (S.length bstr)
   sink <- getSink
   case sink of
     DynamicSink dRef -> do
@@ -612,6 +619,7 @@ foreign import ccall unsafe "strlen" c_pure_strlen :: CString -> CSize
 -- given 'CStringLen' does not point to a constant memory block.
 unsafeCStringLen :: CStringLen -> Builder
 unsafeCStringLen (ptr, len) = mappend (ensureBytes len) $ mkBuilder $ do
+  setLen len
   cur <- getCur
   io $ copyBytes cur (castPtr ptr) len
   setCur $ cur `plusPtr` len
@@ -671,7 +679,7 @@ remainingBytes = minusPtr <$> getEnd <*> getCur
 --  @rebuild $ case x of ... @
 rebuild :: Builder -> Builder
 rebuild (Builder f) = Builder $ oneShot $ \dex -> oneShot $
-  \(# cur, end, s #) -> f dex (# cur, end, s #)
+  \(# cur, end, len, s #) -> f dex (# cur, end, len, s #)
 
 ----------------------------------------------------------------
 -- ThreadedSink
